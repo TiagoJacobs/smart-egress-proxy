@@ -1,0 +1,22 @@
+# Dependencies — reinstalled inside the image for the correct platform.
+node_modules
+dashboard/node_modules
+
+# Build artifacts — regenerated during the image build.
+dashboard/dist
+
+# Version control / local tooling.
+.git
+.gitignore
+.github
+
+# Logs and editor/OS cruft.
+npm-debug.log*
+yarn-error.log*
+*.local
+.vite
+.DS_Store
+
+# Docker files themselves don't need to be in the build context.
+Dockerfile
+.dockerignore

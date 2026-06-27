@@ -1,0 +1,27 @@
+{
+  "name": "smart-egress-proxy",
+  "version": "0.1.0",
+  "description": "Single-process forward proxy that monitors upstream proxies (and the direct connection) and routes egress traffic through the healthiest one.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build:dashboard": "npm --prefix dashboard install && npm --prefix dashboard run build"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "tsx": "^4.19.2",
+    "undici": "^6.21.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.3"
+  }
+}

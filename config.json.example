@@ -1,0 +1,47 @@
+{
+  "monitoredUrls": [
+    {
+      "url": "https://www.google.com",
+      "expectedResponseCode": 200,
+      "fetchBytesLimit": 1048576,
+      "acceptedResponseTimeMs": 2000
+    },
+    {
+      "url": "https://www.cloudflare.com",
+      "expectedResponseCode": 200,
+      "fetchBytesLimit": 2097152,
+      "acceptedResponseTimeMs": 3000
+    },
+    {
+      "url": "https://example.com",
+      "expectedResponseCode": 200,
+      "fetchBytesLimit": 524288,
+      "acceptedResponseTimeMs": 2500
+    }
+  ],
+  "upstreamProxies": [
+    {
+      "name": "proxy-eu",
+      "url": "euuser:eupass@proxy-eu.example.com:8080",
+      "priorityOrder": 1
+    },
+    {
+      "name": "proxy-us",
+      "url": "http://ususer:uspass@proxy-us.example.com:8080",
+      "priorityOrder": 2
+    }
+  ],
+  "settings": {
+    "probeIntervalMinutes": 5,
+    "directPriorityOrder": 100,
+    "defaultMode": "AUTO"
+  },
+  "adminDashboardCredentials": {
+    "anonymous": false,
+    "user": "admin",
+    "pass": "change-me"
+  },
+  "proxyCredentials": {
+    "anonymous": true
+  }
+}

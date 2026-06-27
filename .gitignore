@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+dashboard/node_modules/
+
+# Build artifacts
+dashboard/dist/
+dist/
+.vite/
+
+# Runtime state (persisted mode lives here by default)
+/data/
+state.json
+
+# Logs
+npm-debug.log*
+yarn-error.log*
+*.log
+
+# Local config / secrets — never commit a real SEP_CONFIG
+config.json
+config.local.json
+.env
+.env.*
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
