@@ -166,6 +166,7 @@ the username and password the first time you open it.
 | `DASHBOARD_PORT` | `443` | Dashboard port. |
 | `STATE_DIR` | `/data` | Where the selected mode is saved. The app keeps running in-memory if this is missing or unwritable. |
 | `STATIC_DIR` | `./dashboard/dist` | Location of the built dashboard files. |
+| `BIND_ADDR` | (all interfaces) | Interface the proxy and dashboard listen on. Leave unset for the documented bridge setup, where `-p 127.0.0.1:3128:3128` already constrains exposure. Set to `127.0.0.1` when running with `--network host`, where there is no Docker port mapping and the default would otherwise publish on every interface. |
 
 ## Security
 
@@ -175,6 +176,10 @@ a network you don't fully trust, since an open forward proxy can be abused to
 relay other people's traffic. If you must expose the dashboard, protect it with
 `adminDashboardCredentials`. Proxy and credential passwords are never returned by
 the API or sent to the browser.
+
+When you run with `--network host` (no Docker port mapping to fall back on),
+set `BIND_ADDR=127.0.0.1` so the proxy and dashboard stay on loopback instead of
+binding every interface.
 
 ## Architecture & development
 

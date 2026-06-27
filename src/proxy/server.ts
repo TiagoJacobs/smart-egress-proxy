@@ -491,8 +491,14 @@ export function createProxyServer(): http.Server {
   });
 
   const port = Number(process.env.PROXY_PORT || 3128);
-  server.listen(port, () => {
-    console.log(`[proxy] forward proxy listening on port ${port}`);
+  // BIND_ADDR scopes the listening interface. Unset → Node's default (all
+  // interfaces), preserving the documented bridge usage where Docker's
+  // `-p 127.0.0.1:3128:3128` provides the loopback guard. Set it to 127.0.0.1
+  // when running with `--network host`, where there is no Docker port mapping
+  // to constrain exposure and binding all interfaces would publish on the LAN.
+  const host = process.env.BIND_ADDR || undefined;
+  server.listen(port, host, () => {
+    console.log(`[proxy] forward proxy listening on ${host ?? "0.0.0.0"}:${port}`);
   });
 
   return server;
