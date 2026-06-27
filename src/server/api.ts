@@ -227,8 +227,11 @@ export function createApiServer(): http.Server {
 
   const server = http.createServer(app);
   const port = Number(process.env.DASHBOARD_PORT ?? 443);
-  server.listen(port, () => {
-    console.log(`[api] Dashboard + API listening on port ${port}`);
+  // See BIND_ADDR note in proxy/server.ts: unset keeps the all-interfaces
+  // default; set to 127.0.0.1 under `--network host` to stay on loopback.
+  const host = process.env.BIND_ADDR || undefined;
+  server.listen(port, host, () => {
+    console.log(`[api] Dashboard + API listening on ${host ?? "0.0.0.0"}:${port}`);
   });
 
   return server;
