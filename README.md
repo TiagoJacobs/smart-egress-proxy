@@ -167,6 +167,8 @@ the username and password the first time you open it.
 | `STATE_DIR` | `/data` | Where the selected mode is saved. The app keeps running in-memory if this is missing or unwritable. |
 | `STATIC_DIR` | `./dashboard/dist` | Location of the built dashboard files. |
 | `BIND_ADDR` | (all interfaces) | Interface the proxy and dashboard listen on. Leave unset for the documented bridge setup, where `-p 127.0.0.1:3128:3128` already constrains exposure. Set to `127.0.0.1` when running with `--network host`, where there is no Docker port mapping and the default would otherwise publish on every interface. |
+| `PROXY_BIND_ADDR` | (falls back to `BIND_ADDR`) | Interface for the **forward proxy** alone. Overrides `BIND_ADDR` for the proxy. Use it to pin the proxy to `127.0.0.1` while the dashboard listens elsewhere. |
+| `DASHBOARD_BIND_ADDR` | (falls back to `BIND_ADDR`) | Interface for the **dashboard/API** alone. Overrides `BIND_ADDR` for the dashboard. Lets you expose only the dashboard (e.g. on a VPN-routed LAN address) while the proxy stays on loopback. |
 
 ## Security
 
@@ -180,6 +182,12 @@ the API or sent to the browser.
 When you run with `--network host` (no Docker port mapping to fall back on),
 set `BIND_ADDR=127.0.0.1` so the proxy and dashboard stay on loopback instead of
 binding every interface.
+
+To expose **only the dashboard** (for example over a VPN, where the tunnel
+already encrypts traffic) while keeping the forward proxy unreachable, set
+`PROXY_BIND_ADDR=127.0.0.1` and `DASHBOARD_BIND_ADDR=0.0.0.0`. The proxy stays on
+loopback (it must never be an open relay) while the dashboard binds a reachable
+interface — gate it with `adminDashboardCredentials`.
 
 ## Architecture & development
 
