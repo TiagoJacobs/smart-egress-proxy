@@ -496,7 +496,9 @@ export function createProxyServer(): http.Server {
   // `-p 127.0.0.1:3128:3128` provides the loopback guard. Set it to 127.0.0.1
   // when running with `--network host`, where there is no Docker port mapping
   // to constrain exposure and binding all interfaces would publish on the LAN.
-  const host = process.env.BIND_ADDR || undefined;
+  // PROXY_BIND_ADDR overrides BIND_ADDR for the proxy alone — useful to keep the
+  // forward proxy on loopback while the dashboard binds elsewhere (see api.ts).
+  const host = process.env.PROXY_BIND_ADDR || process.env.BIND_ADDR || undefined;
   server.listen(port, host, () => {
     console.log(`[proxy] forward proxy listening on ${host ?? "0.0.0.0"}:${port}`);
   });
