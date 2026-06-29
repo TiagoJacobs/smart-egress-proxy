@@ -41,7 +41,7 @@ cp config.json.example config.json
 # 2. run it, bound to 127.0.0.1 (only your machine can reach it)
 docker run -d --name smart-egress-proxy \
   -p 127.0.0.1:3128:3128 \
-  -p 127.0.0.1:443:443 \
+  -p 127.0.0.1:8080:8080 \
   -e SEP_CONFIG="$(cat config.json)" \
   -v "$PWD/data:/data" \
   tdjac0bs/smart-egress-proxy:latest
@@ -50,7 +50,7 @@ docker run -d --name smart-egress-proxy \
 Then:
 
 - Point your browser or OS **HTTP and HTTPS proxy** at `127.0.0.1:3128`.
-- Open the dashboard at **http://127.0.0.1:443/**.
+- Open the dashboard at **http://127.0.0.1:8080/**.
 - Watch it route, and try flipping between `AUTO`, `DIRECT`, and a specific proxy.
 
 ```bash
@@ -121,7 +121,7 @@ validated on startup, so a bad config fails fast with a clear message. Minimal e
 | --- | --- | --- |
 | `SEP_CONFIG` | (required) | The whole configuration, as a JSON string. |
 | `PROXY_PORT` | `3128` | Forward proxy port. |
-| `DASHBOARD_PORT` | `443` | Dashboard port. |
+| `DASHBOARD_PORT` | `8080` | Dashboard port (plain HTTP, on loopback). |
 | `BIND_ADDR` | (all interfaces) | Interface both servers listen on. Leave unset with the `-p 127.0.0.1:...` mapping above. Set to `127.0.0.1` when running with `--network host`. |
 | `PROXY_BIND_ADDR` | (falls back to `BIND_ADDR`) | Interface for the forward proxy alone. |
 | `DASHBOARD_BIND_ADDR` | (falls back to `BIND_ADDR`) | Interface for the dashboard alone. |
@@ -154,8 +154,10 @@ with `adminDashboardCredentials`.
 
 ## How it works and contributing
 
-Architecture, the per-component internals, and local development are in
-[AGENTS.md](./AGENTS.md).
+Want to understand how it is built or hack on it? The architecture, the
+per-component internals, and local development are all documented in
+**[ARCHITECTURE.md](./ARCHITECTURE.md)**. It is written for humans first (coding
+agents read the same file via [AGENTS.md](./AGENTS.md)).
 
 ## License
 

@@ -51,7 +51,7 @@ COPY --from=build /app/dashboard/dist ./dashboard/dist
 # Persisted runtime state (the selected mode lives in $STATE_DIR/state.json).
 VOLUME ["/data"]
 
-# 3128 = forward proxy, 443 = dashboard + JSON API.
-EXPOSE 3128 443
+# 3128 = forward proxy, 8080 = dashboard + JSON API.
+EXPOSE 3128 8080
 
 CMD ["npx", "tsx", "src/index.ts"]

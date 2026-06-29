@@ -6,7 +6,7 @@ import react from "@vitejs/plugin-react";
 // asset URLs relative so they work regardless of mount path.
 //
 // In dev (`npm run dev`), Vite serves the SPA and proxies `/api/*` to the
-// running Node server on the dashboard port (default 443).
+// running Node server on the dashboard port (default 8080).
 export default defineConfig({
   plugins: [react()],
   base: "./",
@@ -17,7 +17,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "http://localhost:443",
+        target: "http://localhost:8080",
         changeOrigin: true,
         secure: false,
       },

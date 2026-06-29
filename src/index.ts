@@ -8,7 +8,7 @@
  *      persisted/default mode).
  *   3. Start the three long-running pieces that share that store:
  *        - the forward HTTP proxy   (PROXY_PORT, default 3128)
- *        - the dashboard + JSON API (DASHBOARD_PORT, default 443)
+ *        - the dashboard + JSON API (DASHBOARD_PORT, default 8080)
  *        - the background prober    (every settings.probeIntervalMinutes)
  *   4. Shut everything down cleanly on SIGTERM / SIGINT.
  *
@@ -30,7 +30,7 @@ import type http from "node:http";
 function resolvePorts(): { proxyPort: number; dashboardPort: number } {
   return {
     proxyPort: Number(process.env.PROXY_PORT || 3128),
-    dashboardPort: Number(process.env.DASHBOARD_PORT ?? 443),
+    dashboardPort: Number(process.env.DASHBOARD_PORT ?? 8080),
   };
 }
 

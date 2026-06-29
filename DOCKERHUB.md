@@ -17,7 +17,7 @@ health prober, and a dashboard.
   (`DIRECT`, or a specific proxy).
 - **Throughput-aware probing:** each route is tested by downloading a bounded number
   of bytes and timing it, so slow routes are caught, not just dead ones.
-- **Live dashboard** on port `443`: per-route health, one-click route switching, and
+- **Live dashboard** on port `8080`: per-route health, one-click route switching, and
   a comparative response-time history.
 - **Secrets stay secret:** proxy and dashboard passwords are never returned by the
   API or shown in the dashboard.
@@ -30,7 +30,7 @@ so only your machine can reach them:
 ```bash
 docker run -d --name smart-egress-proxy \
   -p 127.0.0.1:3128:3128 \
-  -p 127.0.0.1:443:443 \
+  -p 127.0.0.1:8080:8080 \
   -e SEP_CONFIG="$(cat config.json)" \
   -v "$PWD/data:/data" \
   tdjac0bs/smart-egress-proxy:latest
@@ -39,7 +39,7 @@ docker run -d --name smart-egress-proxy \
 Then:
 
 - Point your browser/OS **HTTP and HTTPS proxy** at `127.0.0.1:3128`.
-- Open the dashboard at **http://127.0.0.1:443/**.
+- Open the dashboard at **http://127.0.0.1:8080/**.
 
 (The `-v .../data` mount is optional; it remembers your selected route across restarts.)
 
@@ -77,13 +77,13 @@ variable. Minimal example:
 | Port | Service |
 | --- | --- |
 | `3128` | Forward proxy |
-| `443` | Dashboard (HTTP) |
+| `8080` | Dashboard (HTTP) |
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SEP_CONFIG` | (required) | Configuration as a JSON string. |
 | `PROXY_PORT` | `3128` | Forward proxy port. |
-| `DASHBOARD_PORT` | `443` | Dashboard port. |
+| `DASHBOARD_PORT` | `8080` | Dashboard port. |
 | `STATE_DIR` | `/data` | Where the selected route is persisted. |
 
 ## Tags

@@ -146,7 +146,7 @@ function modeFromBody(body: unknown): Mode {
 
 /**
  * Build, wire and start the dashboard + API HTTP server.
- * Listens on DASHBOARD_PORT (default 443) and returns the http.Server.
+ * Listens on DASHBOARD_PORT (default 8080) and returns the http.Server.
  * Must be called after the store has been initialised.
  */
 export function createApiServer(): http.Server {
@@ -226,7 +226,7 @@ export function createApiServer(): http.Server {
   });
 
   const server = http.createServer(app);
-  const port = Number(process.env.DASHBOARD_PORT ?? 443);
+  const port = Number(process.env.DASHBOARD_PORT ?? 8080);
   // See BIND_ADDR note in proxy/server.ts: unset keeps the all-interfaces
   // default; set to 127.0.0.1 under `--network host` to stay on loopback.
   // DASHBOARD_BIND_ADDR overrides BIND_ADDR for the dashboard alone, lets the
