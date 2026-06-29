@@ -229,7 +229,7 @@ export function createApiServer(): http.Server {
   const port = Number(process.env.DASHBOARD_PORT ?? 443);
   // See BIND_ADDR note in proxy/server.ts: unset keeps the all-interfaces
   // default; set to 127.0.0.1 under `--network host` to stay on loopback.
-  // DASHBOARD_BIND_ADDR overrides BIND_ADDR for the dashboard alone — lets the
+  // DASHBOARD_BIND_ADDR overrides BIND_ADDR for the dashboard alone, lets the
   // dashboard listen on a reachable interface (e.g. a VPN-routed LAN IP) while
   // PROXY_BIND_ADDR keeps the forward proxy on loopback.
   const host = process.env.DASHBOARD_BIND_ADDR || process.env.BIND_ADDR || undefined;
