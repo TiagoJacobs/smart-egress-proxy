@@ -237,7 +237,7 @@ function handleRequest(
 
   const headers = forwardHeaders(req.headers);
 
-  let options: http.RequestOptions;
+  let options: https.RequestOptions;
   let useHttps = false;
   if (egress.kind === "proxy") {
     const upstream = upstreamForEgress(egress);
@@ -262,6 +262,16 @@ function handleRequest(
       path: req.url,
       headers,
     };
+    if (useHttps) {
+      // `headers` still carries the destination in Host, which is what the
+      // upstream proxy needs, but Node derives the TLS servername from that
+      // header when it is present. Left alone it would validate the upstream's
+      // certificate against the destination hostname and fail every request.
+      // Pin it to the proxy instead; an empty string disables SNI for an
+      // IP-addressed upstream (RFC 6066 forbids IP servernames), which leaves
+      // the certificate checked against the IP itself.
+      options.servername = net.isIP(upstream.host) ? "" : upstream.host;
+    }
   } else {
     // DIRECT: connect straight to the origin server with an origin-form path.
     options = {
