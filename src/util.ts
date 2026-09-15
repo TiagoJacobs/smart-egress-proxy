@@ -17,10 +17,33 @@ export interface ParsedUpstreamUrl {
 const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//;
 
 /**
+ * Render a host and port back into an authority string, re-bracketing an IPv6
+ * literal. `host` values produced by parseUpstreamUrl are always bare, which is
+ * what net.connect, tls.connect and net.isIP expect, but anything that composes
+ * a URL or a request line needs the brackets back or the result is unparseable.
+ * A bare host containing ":" can only be an IPv6 literal, since a DNS name or an
+ * IPv4 address never does.
+ */
+export function formatAuthority(host: string, port: number): string {
+  return host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+/**
+ * Strip the brackets from an IPv6 literal host. WHATWG URL keeps them in
+ * `hostname`, while net.connect, tls.connect and http.request all need the bare
+ * address or they try to resolve the literal string as a DNS name.
+ */
+export function unbracketHost(host: string): string {
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+}
+
+/**
  * Parse an upstream proxy URL of the form "[http://]user:pass@host:port" or
- * "host:port" (anonymous). The scheme, if present, is ignored. The username
- * and password are optional. Throws a clear Error if host or port are missing
- * or the port is out of range.
+ * "host:port" (anonymous). The scheme selects TLS-to-the-proxy and is otherwise
+ * ignored. The username and password are optional, an IPv6 literal host may be
+ * bracketed, and a trailing path or slash is tolerated and discarded. The
+ * returned host is never bracketed. Throws a clear Error if host or port are
+ * missing or the port is out of range.
  */
 export function parseUpstreamUrl(url: string): ParsedUpstreamUrl {
   let rest = url.trim();
@@ -54,15 +77,43 @@ export function parseUpstreamUrl(url: string): ParsedUpstreamUrl {
     }
   }
 
-  const colonIndex = rest.lastIndexOf(":");
-  if (colonIndex === -1) {
-    throw new Error(
-      `Invalid upstream proxy url "${url}": missing port (expected host:port)`,
-    );
+  // Drop a trailing path. Only now, after the credentials are out of the way, so
+  // that a password containing "/" is never mistaken for the start of a path.
+  const slashIndex = rest.indexOf("/");
+  if (slashIndex !== -1) {
+    rest = rest.slice(0, slashIndex);
   }
 
-  const host = rest.slice(0, colonIndex);
-  const portStr = rest.slice(colonIndex + 1);
+  // Split the authority. A bracketed IPv6 literal has to be found by its closing
+  // bracket, because scanning for the last ":" would land inside the address.
+  let host: string;
+  let portStr: string;
+  if (rest.startsWith("[")) {
+    const closing = rest.indexOf("]");
+    if (closing === -1) {
+      throw new Error(
+        `Invalid upstream proxy url "${url}": unterminated IPv6 literal`,
+      );
+    }
+    host = rest.slice(1, closing);
+    const remainder = rest.slice(closing + 1);
+    if (!remainder.startsWith(":")) {
+      throw new Error(
+        `Invalid upstream proxy url "${url}": missing port (expected [host]:port)`,
+      );
+    }
+    portStr = remainder.slice(1);
+  } else {
+    const colonIndex = rest.lastIndexOf(":");
+    if (colonIndex === -1) {
+      throw new Error(
+        `Invalid upstream proxy url "${url}": missing port (expected host:port)`,
+      );
+    }
+    host = rest.slice(0, colonIndex);
+    portStr = rest.slice(colonIndex + 1);
+  }
+
   const port = Number(portStr);
 
   if (host === "") {
@@ -92,13 +143,14 @@ export function maskUrl(url: string): string {
   try {
     const { host, port, user, pass, secure } = parseUpstreamUrl(url);
     const scheme = secure ? "https://" : "http://";
+    const authority = formatAuthority(host, port);
     if (user !== undefined && pass !== undefined) {
-      return `${scheme}${user}:***@${host}:${port}`;
+      return `${scheme}${user}:***@${authority}`;
     }
     if (user !== undefined) {
-      return `${scheme}${user}@${host}:${port}`;
+      return `${scheme}${user}@${authority}`;
     }
-    return `${scheme}${host}:${port}`;
+    return `${scheme}${authority}`;
   } catch {
     // Fallback: blunt-mask anything that looks like "user:pass@".
     return url.replace(/([^/@:]+):([^@/]+)@/, (_m, u: string) => `${u}:***@`);

@@ -23,7 +23,7 @@ import { request, ProxyAgent, Agent } from "undici";
 import type { Dispatcher } from "undici";
 
 import { store } from "../state.js";
-import { parseUpstreamUrl, buildBasicAuth } from "../util.js";
+import { parseUpstreamUrl, buildBasicAuth, formatAuthority } from "../util.js";
 import type {
   AppConfig,
   Egress,
@@ -92,7 +92,8 @@ function buildDispatcher(egress: Egress, config: AppConfig): BuiltDispatcher {
 
   const parsed = parseUpstreamUrl(config.upstreamProxies[index].url);
   const options: ProxyAgent.Options = {
-    uri: `${parsed.secure ? "https" : "http"}://${parsed.host}:${parsed.port}`,
+    // formatAuthority re-brackets an IPv6 literal; undici rejects the bare form.
+    uri: `${parsed.secure ? "https" : "http"}://${formatAuthority(parsed.host, parsed.port)}`,
     headersTimeout: HARD_TIMEOUT_MS,
     bodyTimeout: HARD_TIMEOUT_MS,
   };
@@ -258,7 +259,13 @@ export async function runProbeCycle(): Promise<void> {
  */
 export function startProber(): ProberHandle {
   const { probeIntervalMinutes } = store.getConfig().settings;
-  const intervalMs = Math.max(probeIntervalMinutes, 0) * 60_000 || 60_000;
+  // setInterval takes a 32-bit signed delay: anything larger is silently coerced
+  // to 1ms, which would turn a monthly interval into a flat-out probe loop.
+  const MAX_TIMER_MS = 2_147_483_647;
+  const intervalMs = Math.min(
+    Math.max(probeIntervalMinutes, 0) * 60_000 || 60_000,
+    MAX_TIMER_MS,
+  );
 
   let running = false;
   const tick = (): void => {

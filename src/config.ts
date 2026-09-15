@@ -9,6 +9,7 @@
 
 import { z } from "zod";
 import type { AppConfig } from "./types.js";
+import { parseUpstreamUrl } from "./util.js";
 
 const monitoredUrlSchema = z.object({
   url: z.string().url(),
@@ -17,11 +18,26 @@ const monitoredUrlSchema = z.object({
   acceptedResponseTimeMs: z.number().int().positive().default(2000),
 });
 
-const upstreamProxySchema = z.object({
-  name: z.string().min(1),
-  url: z.string().min(1),
-  priorityOrder: z.number().int(),
-});
+const upstreamProxySchema = z
+  .object({
+    name: z.string().min(1),
+    url: z.string().min(1),
+    priorityOrder: z.number().int(),
+  })
+  // Run the URL through the same parser the proxy and prober use at runtime.
+  // Without this a form the parser rejects (a trailing slash, a missing port)
+  // started cleanly and then failed every single request through that egress.
+  .superRefine((entry, ctx) => {
+    try {
+      parseUpstreamUrl(entry.url);
+    } catch (err) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["url"],
+        message: (err as Error).message,
+      });
+    }
+  });
 
 const credentialsSchema = z
   .object({
@@ -41,7 +57,8 @@ const credentialsSchema = z
 
 const settingsSchema = z
   .object({
-    probeIntervalMinutes: z.number().positive().default(5),
+    // Upper bound keeps the value inside setInterval's 32-bit delay.
+    probeIntervalMinutes: z.number().positive().max(10_000).default(5),
     directPriorityOrder: z.number().int().default(100),
     defaultMode: z
       .string()
