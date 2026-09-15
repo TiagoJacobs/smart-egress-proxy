@@ -95,6 +95,19 @@ function splitHostPort(
   return { host, port };
 }
 
+/**
+ * Clamp an upstream status code to what ServerResponse accepts. The HTTP parser
+ * happily produces any three-digit status, including 0 to 99, while writeHead
+ * throws ERR_HTTP_INVALID_STATUS_CODE below 100. Forwarding one verbatim would
+ * escape as an uncaught exception and take the whole process down, so anything
+ * outside 100 to 999 is reported as a 502 instead.
+ */
+function safeStatusCode(statusCode: number | undefined): number {
+  if (statusCode === undefined || !Number.isInteger(statusCode)) return 502;
+  if (statusCode < 100 || statusCode > 999) return 502;
+  return statusCode;
+}
+
 /** Send a 407 over a normal HTTP response (plain-HTTP path). */
 function sendHttp407(res: http.ServerResponse): void {
   const body = "Proxy authentication required";
@@ -288,7 +301,24 @@ function handleRequest(
   );
 
   const proxyReq = (useHttps ? https : http).request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+    try {
+      res.writeHead(safeStatusCode(proxyRes.statusCode), proxyRes.headers);
+    } catch (err) {
+      // A header the upstream parser accepted can still be rejected on the way
+      // out. Fail this one request rather than letting the throw escape the
+      // callback, where nothing would catch it.
+      console.warn(
+        `[proxy] cannot forward upstream response headers: ${(err as Error).message}`,
+      );
+      proxyRes.destroy();
+      if (res.headersSent) {
+        res.destroy();
+      } else {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("Bad Gateway");
+      }
+      return;
+    }
     proxyRes.pipe(res);
     // Response-body bytes from upstream are download (IN). Observer only.
     proxyRes.on("data", (chunk: Buffer) => {

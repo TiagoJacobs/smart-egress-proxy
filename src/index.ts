@@ -34,7 +34,29 @@ function resolvePorts(): { proxyPort: number; dashboardPort: number } {
   };
 }
 
+/**
+ * Last-resort process guards. One process carries every tunnel, every forwarded
+ * request and the dashboard, so a single unhandled throw on one request would be
+ * a full outage for every client. Individual failures are already contained
+ * where they happen; these handlers exist so an unforeseen one degrades to a log
+ * line instead of killing the process.
+ */
+function installProcessGuards(): void {
+  process.on("uncaughtException", (err: Error) => {
+    console.error(
+      `[fatal] Uncaught exception, kept running: ${err.stack ?? err.message}`,
+    );
+  });
+  process.on("unhandledRejection", (reason: unknown) => {
+    const detail =
+      reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    console.error(`[fatal] Unhandled promise rejection, kept running: ${detail}`);
+  });
+}
+
 function main(): void {
+  installProcessGuards();
+
   // 1. Configuration ---------------------------------------------------------
   let config;
   try {
