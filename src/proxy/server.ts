@@ -417,6 +417,13 @@ function handleRequest(
   res.on("close", () => {
     if (!res.writableFinished) proxyReq.destroy();
   });
+  // Both directions need this, not just the response. When the origin answers
+  // before it has read the whole body, the response can finish while the request
+  // body is still in flight; a client that disappears then leaves the upstream
+  // waiting for a body that will never arrive, which the check above cannot see.
+  req.on("close", () => {
+    if (!req.readableEnded) proxyReq.destroy();
+  });
 
   req.pipe(proxyReq);
 }
