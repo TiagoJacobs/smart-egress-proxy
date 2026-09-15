@@ -39,6 +39,34 @@ import type {
  */
 const HARD_TIMEOUT_MS = 30_000;
 
+/** How long to wait for a dispatcher to close gracefully before forcing it. */
+const CLEANUP_TIMEOUT_MS = 5_000;
+
+/**
+ * Resolve `promise`, or fall back to `onTimeout()` once `ms` has elapsed. Nothing
+ * in a cycle may outlive its budget: a cycle that never returns holds the
+ * in-flight guard forever, and from then on nothing is ever re-probed, health
+ * freezes at its last value and failover stops happening at all. `promise` must
+ * not reject, or the rejection is left unhandled when the deadline wins.
+ */
+async function withDeadline<T>(
+  promise: Promise<T>,
+  ms: number,
+  onTimeout: () => T,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(onTimeout()), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /** A running prober that can be stopped. */
 export interface ProberHandle {
   /** Stop the periodic timer. In-flight cycles are allowed to finish. */
@@ -49,6 +77,8 @@ interface BuiltDispatcher {
   dispatcher: Dispatcher;
   /** Gracefully closes the dispatcher created for this egress. */
   close(): Promise<void>;
+  /** Forces it down when a graceful close does not come back. */
+  destroy(): Promise<void>;
 }
 
 /** Truncate and prefix an unknown error into a short, log-safe string. */
@@ -77,7 +107,11 @@ function buildDispatcher(egress: Egress, config: AppConfig): BuiltDispatcher {
       headersTimeout: HARD_TIMEOUT_MS,
       bodyTimeout: HARD_TIMEOUT_MS,
     });
-    return { dispatcher: agent, close: () => agent.close() };
+    return {
+      dispatcher: agent,
+      close: () => agent.close(),
+      destroy: () => agent.destroy(),
+    };
   }
 
   const index = egress.proxyIndex;
@@ -104,7 +138,11 @@ function buildDispatcher(egress: Egress, config: AppConfig): BuiltDispatcher {
   }
 
   const agent = new ProxyAgent(options);
-  return { dispatcher: agent, close: () => agent.close() };
+  return {
+    dispatcher: agent,
+    close: () => agent.close(),
+    destroy: () => agent.destroy(),
+  };
 }
 
 /**
@@ -115,7 +153,7 @@ function buildDispatcher(egress: Egress, config: AppConfig): BuiltDispatcher {
  * Downloads at most `fetchBytesLimit` bytes of the body and measures how long
  * that bounded transfer takes, then compares it against `acceptedResponseTimeMs`.
  */
-async function probeUrl(
+async function runProbe(
   dispatcher: Dispatcher,
   monitored: MonitoredUrl,
 ): Promise<UrlProbeResult> {
@@ -183,6 +221,30 @@ async function probeUrl(
 }
 
 /**
+ * Probe one URL, guaranteed to return. The AbortController inside runProbe is not
+ * enough on its own: for some dispatcher failures the underlying request promise
+ * never settles even after the abort, which used to wedge the whole cycle
+ * permanently. Reproduced against an upstream proxy that accepts the connection
+ * and then refuses CONNECT, where the request neither resolved nor rejected.
+ */
+async function probeUrl(
+  dispatcher: Dispatcher,
+  monitored: MonitoredUrl,
+): Promise<UrlProbeResult> {
+  const hardCap = Math.max(HARD_TIMEOUT_MS, monitored.acceptedResponseTimeMs * 2);
+  const deadline = hardCap + 1_000;
+  const start = performance.now();
+  // runProbe catches everything and never rejects, so racing it is safe.
+  return withDeadline(runProbe(dispatcher, monitored), deadline, () => ({
+    url: monitored.url,
+    ok: false,
+    responseTimeMs: Math.round(performance.now() - start),
+    error: `probe did not settle within ${deadline}ms`,
+    checkedAt: new Date().toISOString(),
+  }));
+}
+
+/**
  * Probe every monitored URL through a single egress and write the aggregated
  * health back to the store. An egress is healthy only when every monitored URL
  * is ok (vacuously healthy when no URLs are configured). Never throws.
@@ -222,10 +284,18 @@ async function probeEgress(egress: Egress, config: AppConfig): Promise<void> {
       lastCheckedAt: new Date().toISOString(),
     });
   } finally {
-    try {
-      await built.close();
-    } catch {
-      // Best-effort cleanup; a failed close must not affect health.
+    // A graceful close waits on in-flight requests, so it can hang for exactly
+    // the reasons probeUrl guards against. Bound it, then force the teardown.
+    const closed = await withDeadline(
+      built.close().then(
+        () => true,
+        () => true,
+      ),
+      CLEANUP_TIMEOUT_MS,
+      () => false,
+    );
+    if (!closed) {
+      void built.destroy().catch(() => undefined);
     }
   }
 }
@@ -253,6 +323,30 @@ export async function runProbeCycle(): Promise<void> {
 }
 
 /**
+ * True while a cycle is in flight. Module-level so the periodic timer and the
+ * dashboard's "probe now" endpoint share one guard.
+ */
+let cycleRunning = false;
+
+/**
+ * Run one cycle unless one is already running, returning false when it declined.
+ * The API endpoint used to call runProbeCycle directly, bypassing the timer's
+ * guard, so repeated calls piled up unbounded concurrent cycles. Each cycle fans
+ * out egresses x urls outbound requests of up to 30s, and 50 of them at once also
+ * overwrote the whole 60-point history ring.
+ */
+export async function runProbeCycleIfIdle(): Promise<boolean> {
+  if (cycleRunning) return false;
+  cycleRunning = true;
+  try {
+    await runProbeCycle();
+    return true;
+  } finally {
+    cycleRunning = false;
+  }
+}
+
+/**
  * Start the prober: run one cycle immediately, then once every
  * settings.probeIntervalMinutes. Overlapping cycles are skipped so a slow cycle
  * cannot pile up. Returns a handle whose stop() clears the timer.
@@ -267,17 +361,12 @@ export function startProber(): ProberHandle {
     MAX_TIMER_MS,
   );
 
-  let running = false;
   const tick = (): void => {
-    if (running) return; // previous cycle still in flight; skip this tick.
-    running = true;
-    runProbeCycle()
-      .catch((err) => {
-        console.warn(`[prober] cycle failed: ${shortError(err)}`);
-      })
-      .finally(() => {
-        running = false;
-      });
+    // Declines silently when a cycle is still in flight, including one started
+    // from the dashboard.
+    runProbeCycleIfIdle().catch((err) => {
+      console.warn(`[prober] cycle failed: ${shortError(err)}`);
+    });
   };
 
   // Kick off the first cycle immediately (fire-and-forget).

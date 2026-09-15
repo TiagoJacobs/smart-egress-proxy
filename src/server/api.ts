@@ -187,12 +187,16 @@ export function createApiServer(): http.Server {
     res.json(buildStatus());
   });
 
-  // Trigger an immediate probe cycle (best-effort, fire-and-forget).
+  // Trigger an immediate probe cycle. Shares the prober's in-flight guard, so a
+  // burst of calls cannot pile up concurrent cycles and wipe the history ring.
   app.post("/api/probe/run", (_req: Request, res: Response) => {
     void (async () => {
       try {
         const prober = await import("../prober/prober.js");
-        await prober.runProbeCycle();
+        const started = await prober.runProbeCycleIfIdle();
+        if (!started) {
+          console.log("[api] Probe run skipped: a cycle is already in flight.");
+        }
       } catch (err) {
         console.warn(`[api] Immediate probe run failed: ${(err as Error).message}`);
       }
