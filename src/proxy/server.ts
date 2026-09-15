@@ -23,6 +23,8 @@ import { store } from "../state.js";
 import {
   parseUpstreamUrl,
   buildBasicAuth,
+  formatAuthority,
+  unbracketHost,
   type ParsedUpstreamUrl,
 } from "../util.js";
 import type { Egress } from "../types.js";
@@ -92,11 +94,26 @@ function upstreamForEgress(egress: Egress): ParsedUpstreamUrl | null {
   }
 }
 
-/** Split a "host:port" authority (CONNECT target) with a default port fallback. */
+/**
+ * Split a "host:port" authority (CONNECT target) with a default port fallback.
+ * A bracketed IPv6 literal is found by its closing bracket and returned bare,
+ * because scanning for the last ":" would land inside the address and net.connect
+ * cannot resolve a bracketed string. Use formatAuthority to put it back together.
+ */
 function splitHostPort(
   authority: string,
   defaultPort: number,
 ): { host: string; port: number } {
+  if (authority.startsWith("[")) {
+    const closing = authority.indexOf("]");
+    if (closing === -1) return { host: "", port: defaultPort };
+    const host = authority.slice(1, closing);
+    const remainder = authority.slice(closing + 1);
+    const port = remainder.startsWith(":")
+      ? Number(remainder.slice(1)) || defaultPort
+      : defaultPort;
+    return { host, port };
+  }
   const idx = authority.lastIndexOf(":");
   if (idx === -1) return { host: authority, port: defaultPort };
   const host = authority.slice(0, idx);
@@ -296,8 +313,10 @@ function handleRequest(
     }
   } else {
     // DIRECT: connect straight to the origin server with an origin-form path.
+    // URL.hostname keeps the brackets around an IPv6 literal, which http.request
+    // would then try to resolve as a hostname.
     options = {
-      host: target.hostname,
+      host: unbracketHost(target.hostname),
       port: target.port ? Number(target.port) : 80,
       method: req.method,
       path: (target.pathname || "/") + target.search,
@@ -410,7 +429,9 @@ function handleConnect(
 
   const egress = store.resolveActiveEgress();
   const egressId = egress.id;
-  console.log(`[proxy] CONNECT ${host}:${port} via ${egress.name}`);
+  console.log(
+    `[proxy] CONNECT ${formatAuthority(host, port)} via ${egress.name}`,
+  );
 
   // Usage accounting: a CONNECT tunnel counts as one request, and stays an open
   // connection until the client socket closes. Byte counters are attached when
@@ -435,6 +456,83 @@ function handleConnect(
   }
 }
 
+/**
+ * Cap on client bytes buffered before a tunnel is spliced. A TLS ClientHello is
+ * a few hundred bytes, so anything approaching this is not a real client.
+ */
+const MAX_PENDING_CLIENT_BYTES = 65536;
+
+/**
+ * Own the window between accepting a CONNECT and splicing the tunnel. That window
+ * used to have no owner at all: the client could leave, and the peer could go
+ * quiet or hang up, with nothing noticing either way.
+ *
+ * Returns two one-shot callbacks. `fail` answers the client 502 and tears both
+ * sockets down; `spliced` hands ownership to bidirectionalPipe and returns the
+ * client bytes that arrived in the meantime, for the caller to forward. Because
+ * they are one-shot, a 502 that belongs to a failed handshake can never be
+ * written into a tunnel that already carries traffic.
+ */
+function guardTunnelHandshake(
+  clientSocket: net.Socket,
+  serverSocket: net.Socket,
+  head: Buffer,
+  label: string,
+): { spliced: () => Buffer; fail: (reason: string) => void } {
+  let settled = false;
+  let pending = head;
+
+  const fail = (reason: string): void => {
+    if (settled) return;
+    settled = true;
+    console.warn(`[proxy] CONNECT ${label} failed: ${reason}`);
+    serverSocket.destroy();
+    if (!clientSocket.destroyed) {
+      clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      clientSocket.end();
+    }
+  };
+
+  // Read the client's early bytes instead of leaving the socket paused. Paused
+  // with nobody reading it, a client that hangs up mid-handshake is never
+  // noticed: its FIN sits unread, so the client socket stays in CLOSE-WAIT and
+  // the peer socket stays established, two descriptors held for the life of the
+  // process. Whatever arrives here is handed to the peer at splice time, so
+  // nothing the client sends ahead of the 200 is lost or reordered.
+  const onClientData = (chunk: Buffer): void => {
+    pending = Buffer.concat([pending, chunk]);
+    if (pending.length > MAX_PENDING_CLIENT_BYTES) {
+      fail("client sent too much data before the tunnel was established");
+    }
+  };
+  const onClientGone = (): void => fail("client went away during the handshake");
+
+  clientSocket.on("data", onClientData);
+  clientSocket.once("end", onClientGone);
+  clientSocket.once("close", onClientGone);
+
+  // Nothing bounded this wait before, so a peer that accepted the connection and
+  // then said nothing held the client open indefinitely. This also covers a
+  // blackholed SYN, where the kernel would otherwise decide the deadline.
+  serverSocket.setTimeout(UPSTREAM_IDLE_TIMEOUT_MS, () => {
+    fail(`no response within ${UPSTREAM_IDLE_TIMEOUT_MS}ms`);
+  });
+
+  const spliced = (): Buffer => {
+    settled = true;
+    clientSocket.removeListener("data", onClientData);
+    clientSocket.removeListener("end", onClientGone);
+    clientSocket.removeListener("close", onClientGone);
+    // Drop the idle timer: a spliced tunnel is allowed to sit quiet for as long
+    // as both ends want (an idle WebSocket, a held-open session), and from here
+    // bidirectionalPipe owns teardown on both sides.
+    serverSocket.setTimeout(0);
+    return pending;
+  };
+
+  return { spliced, fail };
+}
+
 /** DIRECT tunnel: open a TCP socket to the origin and pipe both ways. */
 function connectDirect(
   clientSocket: net.Socket,
@@ -443,19 +541,24 @@ function connectDirect(
   port: number,
   egressId: string,
 ): void {
-  const serverSocket = net.connect(port, host, () => {
+  const serverSocket = net.connect(port, host);
+  const guard = guardTunnelHandshake(
+    clientSocket,
+    serverSocket,
+    head,
+    `direct to ${formatAuthority(host, port)}`,
+  );
+
+  serverSocket.on("connect", () => {
+    const pending = guard.spliced();
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-    if (head.length > 0) serverSocket.write(head);
+    if (pending.length > 0) serverSocket.write(pending);
     bidirectionalPipe(clientSocket, serverSocket, egressId);
   });
 
-  serverSocket.on("error", (err) => {
-    console.warn(`[proxy] CONNECT direct error to ${host}:${port}: ${err.message}`);
-    if (!clientSocket.destroyed) {
-      clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-      clientSocket.end();
-    }
-  });
+  // One-shot: once spliced, teardown belongs to bidirectionalPipe, so a later
+  // reset can no longer inject an HTTP 502 into an established byte stream.
+  serverSocket.on("error", (err) => guard.fail(err.message));
 }
 
 /**
@@ -471,11 +574,12 @@ function connectViaUpstream(
   upstream: ParsedUpstreamUrl,
   egressId: string,
 ): void {
+  const target = formatAuthority(host, port);
+  const via = formatAuthority(upstream.host, upstream.port);
   let serverSocket: net.Socket;
 
   const sendConnect = (): void => {
-    let connectReq =
-      `CONNECT ${host}:${port} HTTP/1.1\r\n` + `Host: ${host}:${port}\r\n`;
+    let connectReq = `CONNECT ${target} HTTP/1.1\r\n` + `Host: ${target}\r\n`;
     if (upstream.user !== undefined) {
       connectReq += `Proxy-Authorization: ${buildBasicAuth(
         upstream.user,
@@ -487,66 +591,81 @@ function connectViaUpstream(
   };
 
   // An "https://" upstream proxy must be reached over TLS; a plain one over TCP.
+  // The servername is pinned to the proxy, never to the destination. RFC 6066
+  // forbids an IP servername and Node deprecates setting one, so an IP-addressed
+  // upstream sends no SNI and its certificate is checked against the IP itself.
   serverSocket = upstream.secure
     ? tls.connect(
-        { host: upstream.host, port: upstream.port, servername: upstream.host },
+        {
+          host: upstream.host,
+          port: upstream.port,
+          ...(net.isIP(upstream.host) ? {} : { servername: upstream.host }),
+        },
         sendConnect,
       )
     : net.connect(upstream.port, upstream.host, sendConnect);
+
+  const guard = guardTunnelHandshake(
+    clientSocket,
+    serverSocket,
+    head,
+    `${target} via ${via}`,
+  );
 
   // Accumulate the upstream's CONNECT response until we have its header block.
   let buffer = Buffer.alloc(0);
   const onData = (chunk: Buffer): void => {
     buffer = Buffer.concat([buffer, chunk]);
-    const sep = buffer.indexOf("\r\n\r\n");
-    if (sep === -1) {
-      // Guard against an upstream that never finishes its response headers.
-      if (buffer.length > 65536) {
-        serverSocket.destroy();
-        if (!clientSocket.destroyed) {
-          clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-          clientSocket.end();
+
+    // Loop so that interim 1xx responses, each its own header block, are skipped
+    // rather than mistaken for the final status.
+    for (;;) {
+      const sep = buffer.indexOf("\r\n\r\n");
+      if (sep === -1) {
+        // Guard against an upstream that never finishes its response headers.
+        if (buffer.length > 65536) {
+          guard.fail("response headers exceeded 64 KiB");
         }
+        return;
       }
-      return;
-    }
 
-    serverSocket.removeListener("data", onData);
+      const statusLine = buffer.slice(0, sep).toString("ascii").split("\r\n")[0];
+      const m = /^HTTP\/\d\.\d\s+(\d{3})/.exec(statusLine);
+      const status = m ? Number(m[1]) : 0;
 
-    const statusLine = buffer.slice(0, sep).toString("ascii").split("\r\n")[0];
-    const m = /^HTTP\/\d\.\d\s+(\d{3})/.exec(statusLine);
-    const status = m ? Number(m[1]) : 0;
+      if (status >= 100 && status < 200) {
+        buffer = buffer.slice(sep + 4);
+        continue;
+      }
 
-    if (status === 200) {
+      serverSocket.removeListener("data", onData);
+
+      if (status !== 200) {
+        guard.fail(`refused (${statusLine || "no status line"})`);
+        return;
+      }
+
+      const pending = guard.spliced();
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       // Forward any tunnelled bytes that arrived past the CONNECT headers.
       const leftover = buffer.slice(sep + 4);
       if (leftover.length > 0) clientSocket.write(leftover);
-      if (head.length > 0) serverSocket.write(head);
+      if (pending.length > 0) serverSocket.write(pending);
       bidirectionalPipe(clientSocket, serverSocket, egressId);
-    } else {
-      console.warn(
-        `[proxy] upstream ${upstream.host}:${upstream.port} refused CONNECT ` +
-          `(${statusLine || "no status line"})`,
-      );
-      serverSocket.destroy();
-      if (!clientSocket.destroyed) {
-        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-        clientSocket.end();
-      }
+      return;
     }
   };
 
   serverSocket.on("data", onData);
-  serverSocket.on("error", (err) => {
-    console.warn(
-      `[proxy] upstream connect error to ${upstream.host}:${upstream.port}: ${err.message}`,
-    );
-    if (!clientSocket.destroyed) {
-      clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-      clientSocket.end();
-    }
-  });
+  serverSocket.on("error", (err) => guard.fail(err.message));
+
+  // A clean FIN is not an error, so an upstream that hangs up before completing
+  // its response would otherwise leave the client waiting on a socket that will
+  // never carry either a 200 or a 502. Both are no-ops once spliced.
+  const closedEarly = (): void =>
+    guard.fail("upstream closed before completing its CONNECT response");
+  serverSocket.on("end", closedEarly);
+  serverSocket.on("close", closedEarly);
 }
 
 /* ------------------------------------------------------------------ */
