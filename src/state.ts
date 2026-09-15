@@ -21,7 +21,7 @@ import type {
   Mode,
   Usage,
 } from "./types.js";
-import { maskUrl, parseMode } from "./util.js";
+import { maskUrl, parseMode, modeToString } from "./util.js";
 
 /** Cumulative byte/request counters for one egress route. */
 interface EgressUsageCounters {
@@ -57,6 +57,12 @@ interface InternalState {
 
 interface PersistedState {
   mode: Mode;
+  /**
+   * Name of the upstream a persisted PROXY mode referred to. Egress identity is
+   * positional, so without this an edit that shifts upstreamProxies silently
+   * re-points the restored mode at a different proxy.
+   */
+  modeUpstreamName?: string;
   history?: Record<string, HistorySample[]>;
 }
 
@@ -150,10 +156,60 @@ export function createStore(): Store {
     return true;
   }
 
+  /**
+   * Monitored URLs that failed through every egress we have actually measured.
+   * A URL that is down everywhere is evidence about the site, not about any
+   * route, so it must not be allowed to condemn every egress at once. Health used
+   * to be a plain AND over all URLs, which meant one unrelated site outage marked
+   * every route unhealthy in a single cycle.
+   */
+  function siteWideFailures(): Set<string> {
+    const measured = [...state.health.values()].filter(
+      (h) => h.results.length > 0,
+    );
+    const out = new Set<string>();
+    if (measured.length === 0) return out;
+
+    const tally = new Map<string, { ok: number; seen: number }>();
+    for (const health of measured) {
+      for (const result of health.results) {
+        const entry = tally.get(result.url) ?? { ok: 0, seen: 0 };
+        entry.seen += 1;
+        if (result.ok) entry.ok += 1;
+        tally.set(result.url, entry);
+      }
+    }
+    for (const [url, entry] of tally) {
+      if (entry.ok === 0 && entry.seen === measured.length) out.add(url);
+    }
+    return out;
+  }
+
+  /**
+   * Score an egress in [0, 1]: the share of monitored URLs it served, ignoring
+   * URLs that no egress could serve. An egress with nothing left to judge by,
+   * because it has never been probed or because every URL was excluded, scores a
+   * neutral 0.5, so "not measured yet" outranks "measured and failing" and loses
+   * to "measured and working". That neutral value is what stops a fresh restart
+   * from treating unknown as unhealthy and dumping all traffic on DIRECT for the
+   * length of the first probe cycle.
+   */
+  function egressScore(egressId: string, excluded: Set<string>): number {
+    const health = state.health.get(egressId);
+    if (health === undefined) return 0.5;
+    const relevant = health.results.filter((r) => !excluded.has(r.url));
+    if (relevant.length === 0) return 0.5;
+    return relevant.filter((r) => r.ok).length / relevant.length;
+  }
+
   function persistState(): void {
     const history: Record<string, HistorySample[]> = {};
     for (const [id, buf] of state.history) history[id] = buf;
     const payload: PersistedState = { mode: state.mode, history };
+    if (state.mode.type === "PROXY" && state.config !== null) {
+      const upstream = state.config.upstreamProxies[state.mode.proxyIndex];
+      if (upstream !== undefined) payload.modeUpstreamName = upstream.name;
+    }
     try {
       fs.mkdirSync(stateDir(), { recursive: true });
       fs.writeFileSync(stateFilePath(), JSON.stringify(payload), "utf8");
@@ -209,10 +265,12 @@ export function createStore(): Store {
   /** Read the persisted mode + history (best-effort; defaults on any error). */
   function readPersisted(): {
     mode: Mode | null;
+    modeUpstreamName: string | null;
     history: Map<string, HistorySample[]>;
   } {
     const result = {
       mode: null as Mode | null,
+      modeUpstreamName: null as string | null,
       history: new Map<string, HistorySample[]>(),
     };
     try {
@@ -220,6 +278,8 @@ export function createStore(): Store {
       const data: unknown = JSON.parse(raw);
       if (data !== null && typeof data === "object") {
         result.mode = parsePersistedMode((data as { mode?: unknown }).mode);
+        const name = (data as { modeUpstreamName?: unknown }).modeUpstreamName;
+        if (typeof name === "string" && name !== "") result.modeUpstreamName = name;
         const h = (data as { history?: unknown }).history;
         if (h !== null && typeof h === "object") {
           for (const [id, pts] of Object.entries(h as Record<string, unknown>)) {
@@ -259,10 +319,42 @@ export function createStore(): Store {
         mode = { type: "AUTO" };
       }
 
-      // ...overridden by a previously persisted manual selection, if any.
+      // ...overridden by a previously persisted manual selection, if any. Say so
+      // out loud: on a persistent volume this silently discards a changed
+      // settings.defaultMode, which is baffling to debug from the outside.
       const persisted = readPersisted();
       if (persisted.mode !== null) {
+        const persistedStr = modeToString(persisted.mode);
+        if (persistedStr !== modeToString(mode)) {
+          console.log(
+            `[state] Persisted mode ${persistedStr} overrides ` +
+              `settings.defaultMode ${modeToString(mode)}.`,
+          );
+        }
         mode = persisted.mode;
+
+        // Egress identity is positional, so a config edit that inserts or
+        // reorders upstreams would silently re-point this mode at a different
+        // proxy. Follow the name that was persisted with it instead.
+        if (mode.type === "PROXY" && persisted.modeUpstreamName !== null) {
+          const name = persisted.modeUpstreamName;
+          if (config.upstreamProxies[mode.proxyIndex]?.name !== name) {
+            const moved = config.upstreamProxies.findIndex((u) => u.name === name);
+            if (moved === -1) {
+              console.warn(
+                `[state] Persisted mode pinned upstream "${name}", which is no ` +
+                  `longer configured. Falling back to AUTO.`,
+              );
+              mode = { type: "AUTO" };
+            } else {
+              console.warn(
+                `[state] Upstream "${name}" moved from index ` +
+                  `${mode.proxyIndex} to ${moved}; following it.`,
+              );
+              mode = { type: "PROXY", proxyIndex: moved };
+            }
+          }
+        }
       }
 
       // Guard against a now-out-of-range PROXY index (config may have changed).
@@ -369,16 +461,25 @@ export function createStore(): Store {
         return { ...(target ?? direct) };
       }
 
-      // AUTO: first egress by priorityOrder ascending whose health is healthy.
+      // AUTO: the best-scoring egress, breaking ties by priority. state.egresses
+      // is already sorted by priorityOrder ascending, so scanning in order gives
+      // the most preferred among equals, and DIRECT competes on its own
+      // directPriorityOrder instead of being a hard-coded last resort. That
+      // matters: the old rule returned the first fully healthy egress and
+      // otherwise went DIRECT, so an egress serving 1 of 2 URLs lost to DIRECT
+      // serving 0 of 2.
+      const excluded = siteWideFailures();
+      let best = direct;
+      let bestScore = -1;
       for (const egress of state.egresses) {
-        const health = state.health.get(egress.id);
-        if (health?.healthy === true) {
-          return { ...egress };
+        const score = egressScore(egress.id, excluded);
+        if (score === 1) return { ...egress };
+        if (score > bestScore) {
+          bestScore = score;
+          best = egress;
         }
       }
-
-      // Nothing healthy: fall back to DIRECT as the last resort.
-      return { ...direct };
+      return { ...best };
     },
 
     recordBytes(egressId: string, inBytes: number, outBytes: number): void {

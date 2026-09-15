@@ -25,6 +25,7 @@ import { createApiServer } from "./server/api.js";
 import { startProber, type ProberHandle } from "./prober/prober.js";
 
 import type http from "node:http";
+import type { AppConfig } from "./types.js";
 
 /** Resolve the effective ports the way each sub-server resolves them, for logging. */
 function resolvePorts(): { proxyPort: number; dashboardPort: number } {
@@ -54,6 +55,27 @@ function installProcessGuards(): void {
   });
 }
 
+/**
+ * Warn about configurations that are legal but quietly disable a safety net. Both
+ * of these are easy to ship by accident and neither shows up as an error anywhere.
+ */
+function warnAboutRiskyConfig(config: AppConfig): void {
+  if (config.monitoredUrls.length === 0) {
+    console.warn(
+      "[startup] No monitoredUrls configured: nothing is measured, so AUTO cannot " +
+        "fail over and simply follows priorityOrder. The dashboard has no health " +
+        "signal to show either.",
+    );
+  }
+  if (config.adminDashboardCredentials.anonymous) {
+    console.warn(
+      "[startup] Dashboard API is anonymous: anyone who can reach the dashboard " +
+        "port can change the egress mode for every client. Bind it to loopback, or " +
+        "set adminDashboardCredentials.",
+    );
+  }
+}
+
 function main(): void {
   installProcessGuards();
 
@@ -66,6 +88,8 @@ function main(): void {
     process.exit(1);
     return; // unreachable, but keeps the type-checker happy.
   }
+
+  warnAboutRiskyConfig(config);
 
   // 2. Shared store ----------------------------------------------------------
   store.initStore(config);

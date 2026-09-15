@@ -134,9 +134,9 @@ validated on startup, so a bad config fails fast with a clear message. Minimal e
 
 Each route has an id: `direct`, or `proxy-0`, `proxy-1`, and so on. The active route follows the current mode, which you set in `settings.defaultMode` and change live from the dashboard:
 
-- **`AUTO`**: the first healthy route by priority. The direct connection takes part using `directPriorityOrder`. If nothing is healthy, it falls back to direct.
+- **`AUTO`**: the first healthy route by priority. The direct connection takes part using `directPriorityOrder`. When no route is fully healthy, the one that served the most monitored URLs wins, and ties go to the better priority; a route that has not been probed yet counts as neutral, so a fresh restart follows your configured priority instead of forcing direct. A monitored URL that fails through *every* route is treated as a problem with that site rather than with any route, and is left out of the comparison, so one site outage cannot condemn every route at once.
 - **`DIRECT`**: always the direct connection.
-- **`PROXY:<index>`**: always that upstream proxy, even if unhealthy. A manual override.
+- **`PROXY:<index>`**: always that upstream proxy, even if unhealthy. A manual override. It is remembered by name, so reordering `upstreamProxies` keeps pointing at the proxy you picked.
 
 ## Security
 
