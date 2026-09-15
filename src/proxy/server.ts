@@ -227,6 +227,67 @@ function trackConnection(emitters: NodeJS.EventEmitter[]): void {
   }
 }
 
+/**
+ * Map the active egress onto the options for one outgoing request. Through an
+ * upstream proxy the request line carries the full absolute URL and the proxy's
+ * own credentials; DIRECT connects straight to the origin in origin form.
+ * Returns null when a proxy egress is misconfigured, so callers can fail cleanly.
+ *
+ * Shared by the plain-HTTP path and the protocol-upgrade path, which differ only
+ * in what they do with the response.
+ */
+function buildForwardOptions(
+  egress: Egress,
+  req: http.IncomingMessage,
+  target: URL,
+): { options: https.RequestOptions; useHttps: boolean } | null {
+  const headers = forwardHeaders(req.headers);
+
+  if (egress.kind === "proxy") {
+    const upstream = upstreamForEgress(egress);
+    if (upstream === null) return null;
+    if (upstream.user !== undefined) {
+      headers["proxy-authorization"] = buildBasicAuth(
+        upstream.user,
+        upstream.pass ?? "",
+      );
+    }
+    const options: https.RequestOptions = {
+      host: upstream.host,
+      port: upstream.port,
+      method: req.method,
+      path: req.url,
+      headers,
+    };
+    // An "https://" upstream means we reach the proxy itself over TLS. `headers`
+    // still carries the destination in Host, which is what the upstream proxy
+    // needs, but Node derives the TLS servername from that header when it is
+    // present. Left alone it would validate the upstream's certificate against
+    // the destination hostname and fail every request. Pin it to the proxy
+    // instead; an empty string disables SNI for an IP-addressed upstream (RFC
+    // 6066 forbids IP servernames), leaving the certificate checked against the
+    // IP itself.
+    if (upstream.secure) {
+      options.servername = net.isIP(upstream.host) ? "" : upstream.host;
+    }
+    return { options, useHttps: upstream.secure };
+  }
+
+  // DIRECT: connect straight to the origin server with an origin-form path.
+  // URL.hostname keeps the brackets around an IPv6 literal, which http.request
+  // would then try to resolve as a hostname.
+  return {
+    options: {
+      host: unbracketHost(target.hostname),
+      port: target.port ? Number(target.port) : 80,
+      method: req.method,
+      path: (target.pathname || "/") + target.search,
+      headers,
+    },
+    useHttps: false,
+  };
+}
+
 /* ------------------------------------------------------------------ */
 /* Plain-HTTP proxying ("request" event)                               */
 /* ------------------------------------------------------------------ */
@@ -274,55 +335,13 @@ function handleRequest(
     }
   });
 
-  const headers = forwardHeaders(req.headers);
-
-  let options: https.RequestOptions;
-  let useHttps = false;
-  if (egress.kind === "proxy") {
-    const upstream = upstreamForEgress(egress);
-    if (upstream === null) {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("Bad Gateway: upstream proxy is misconfigured");
-      return;
-    }
-    // An "https://" upstream means we must reach the proxy itself over TLS.
-    useHttps = upstream.secure;
-    if (upstream.user !== undefined) {
-      headers["proxy-authorization"] = buildBasicAuth(
-        upstream.user,
-        upstream.pass ?? "",
-      );
-    }
-    // Through an upstream proxy the request line carries the full absolute URL.
-    options = {
-      host: upstream.host,
-      port: upstream.port,
-      method: req.method,
-      path: req.url,
-      headers,
-    };
-    if (useHttps) {
-      // `headers` still carries the destination in Host, which is what the
-      // upstream proxy needs, but Node derives the TLS servername from that
-      // header when it is present. Left alone it would validate the upstream's
-      // certificate against the destination hostname and fail every request.
-      // Pin it to the proxy instead; an empty string disables SNI for an
-      // IP-addressed upstream (RFC 6066 forbids IP servernames), which leaves
-      // the certificate checked against the IP itself.
-      options.servername = net.isIP(upstream.host) ? "" : upstream.host;
-    }
-  } else {
-    // DIRECT: connect straight to the origin server with an origin-form path.
-    // URL.hostname keeps the brackets around an IPv6 literal, which http.request
-    // would then try to resolve as a hostname.
-    options = {
-      host: unbracketHost(target.hostname),
-      port: target.port ? Number(target.port) : 80,
-      method: req.method,
-      path: (target.pathname || "/") + target.search,
-      headers,
-    };
+  const forward = buildForwardOptions(egress, req, target);
+  if (forward === null) {
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("Bad Gateway: upstream proxy is misconfigured");
+    return;
   }
+  const { options, useHttps } = forward;
 
   console.log(
     `[proxy] HTTP ${req.method ?? "?"} ${target.host} via ${egress.name}`,
@@ -403,6 +422,117 @@ function handleRequest(
 }
 
 /* ------------------------------------------------------------------ */
+/* Protocol upgrades ("upgrade" event)                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Plain-HTTP protocol upgrades. This is how a browser opens a ws:// WebSocket
+ * through a forward proxy: an absolute-form GET carrying Upgrade and Connection
+ * headers, never a CONNECT (CONNECT is only used for wss://). The same shape
+ * covers h2c and any other plain-HTTP upgrade.
+ *
+ * Without an "upgrade" listener Node delivered these to the plain-HTTP handler,
+ * where the outgoing ClientRequest silently dropped the origin's 101 without
+ * emitting an error, so the client waited forever on a socket that would never
+ * see a byte. Relay the 101 verbatim and splice the two sockets together.
+ */
+function handleUpgrade(
+  req: http.IncomingMessage,
+  clientSocket: net.Socket,
+  head: Buffer,
+): void {
+  clientSocket.on("error", () => clientSocket.destroy());
+
+  if (!clientAuthOk(req.headers["proxy-authorization"])) {
+    sendSocket407(clientSocket);
+    return;
+  }
+
+  let target: URL;
+  try {
+    target = new URL(req.url ?? "");
+  } catch {
+    clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+    clientSocket.end();
+    return;
+  }
+
+  const egress = store.resolveActiveEgress();
+  const egressId = egress.id;
+  console.log(
+    `[proxy] UPGRADE ${String(req.headers.upgrade ?? "?")} ${target.host} ` +
+      `via ${egress.name}`,
+  );
+
+  try {
+    store.recordRequest(egressId);
+  } catch {
+    /* accounting must never disturb the upgrade */
+  }
+  trackConnection([clientSocket]);
+
+  const forward = buildForwardOptions(egress, req, target);
+  if (forward === null) {
+    clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+    clientSocket.end();
+    return;
+  }
+
+  const proxyReq = (forward.useHttps ? https : http).request(forward.options);
+  const guard = guardTunnelHandshake(
+    clientSocket,
+    proxyReq,
+    head,
+    `UPGRADE ${target.host} via ${egress.name}`,
+  );
+
+  proxyReq.on("upgrade", (proxyRes, serverSocket, serverHead) => {
+    const pending = guard.release();
+    const raw = proxyRes.rawHeaders;
+    let response = `HTTP/1.1 ${proxyRes.statusCode ?? 101} ${
+      proxyRes.statusMessage ?? "Switching Protocols"
+    }\r\n`;
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      response += `${raw[i]}: ${raw[i + 1]}\r\n`;
+    }
+    clientSocket.write(`${response}\r\n`);
+    if (serverHead.length > 0) clientSocket.write(serverHead);
+    if (pending.length > 0) serverSocket.write(pending);
+    bidirectionalPipe(clientSocket, serverSocket, egressId);
+  });
+
+  proxyReq.on("response", (proxyRes) => {
+    // The peer declined the upgrade and answered normally (426, 404, 200...).
+    // Relay that answer instead of a 502, so the client sees the real reason, and
+    // frame it by closing: the body we pipe is already decoded, so the upstream's
+    // own framing headers must not be forwarded.
+    guard.release();
+    const raw = proxyRes.rawHeaders;
+    let response = `HTTP/1.1 ${safeStatusCode(proxyRes.statusCode)} ${
+      proxyRes.statusMessage ?? ""
+    }\r\n`;
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      const name = raw[i].toLowerCase();
+      if (name === "transfer-encoding" || name === "content-length") continue;
+      response += `${raw[i]}: ${raw[i + 1]}\r\n`;
+    }
+    response += "Connection: close\r\n\r\n";
+    if (clientSocket.destroyed) {
+      proxyRes.destroy();
+      return;
+    }
+    clientSocket.write(response);
+    proxyRes.pipe(clientSocket);
+    proxyRes.on("error", () => clientSocket.destroy());
+  });
+
+  proxyReq.on("error", (err) => guard.fail(err.message));
+
+  // An upgrade request carries no body.
+  proxyReq.end();
+}
+
+/* ------------------------------------------------------------------ */
 /* HTTPS tunnelling ("connect" event)                                  */
 /* ------------------------------------------------------------------ */
 
@@ -468,24 +598,32 @@ const MAX_PENDING_CLIENT_BYTES = 65536;
  * quiet or hang up, with nothing noticing either way.
  *
  * Returns two one-shot callbacks. `fail` answers the client 502 and tears both
- * sockets down; `spliced` hands ownership to bidirectionalPipe and returns the
- * client bytes that arrived in the meantime, for the caller to forward. Because
+ * sockets down; `release` ends the guarding and returns the client bytes that
+ * arrived in the meantime, for the caller to forward. Because
  * they are one-shot, a 502 that belongs to a failed handshake can never be
  * written into a tunnel that already carries traffic.
+ *
+ * The far side is anything with destroy() and setTimeout(), which covers both a
+ * raw socket (CONNECT) and an outgoing ClientRequest (protocol upgrades).
  */
+interface HandshakePeer {
+  destroy(): void;
+  setTimeout(msecs: number, callback?: () => void): unknown;
+}
+
 function guardTunnelHandshake(
   clientSocket: net.Socket,
-  serverSocket: net.Socket,
+  serverSocket: HandshakePeer,
   head: Buffer,
   label: string,
-): { spliced: () => Buffer; fail: (reason: string) => void } {
+): { release: () => Buffer; fail: (reason: string) => void } {
   let settled = false;
   let pending = head;
 
   const fail = (reason: string): void => {
     if (settled) return;
     settled = true;
-    console.warn(`[proxy] CONNECT ${label} failed: ${reason}`);
+    console.warn(`[proxy] ${label} failed: ${reason}`);
     serverSocket.destroy();
     if (!clientSocket.destroyed) {
       clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
@@ -518,7 +656,7 @@ function guardTunnelHandshake(
     fail(`no response within ${UPSTREAM_IDLE_TIMEOUT_MS}ms`);
   });
 
-  const spliced = (): Buffer => {
+  const release = (): Buffer => {
     settled = true;
     clientSocket.removeListener("data", onClientData);
     clientSocket.removeListener("end", onClientGone);
@@ -530,7 +668,7 @@ function guardTunnelHandshake(
     return pending;
   };
 
-  return { spliced, fail };
+  return { release, fail };
 }
 
 /** DIRECT tunnel: open a TCP socket to the origin and pipe both ways. */
@@ -546,11 +684,11 @@ function connectDirect(
     clientSocket,
     serverSocket,
     head,
-    `direct to ${formatAuthority(host, port)}`,
+    `CONNECT direct to ${formatAuthority(host, port)}`,
   );
 
   serverSocket.on("connect", () => {
-    const pending = guard.spliced();
+    const pending = guard.release();
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     if (pending.length > 0) serverSocket.write(pending);
     bidirectionalPipe(clientSocket, serverSocket, egressId);
@@ -609,7 +747,7 @@ function connectViaUpstream(
     clientSocket,
     serverSocket,
     head,
-    `${target} via ${via}`,
+    `CONNECT ${target} via ${via}`,
   );
 
   // Accumulate the upstream's CONNECT response until we have its header block.
@@ -645,7 +783,7 @@ function connectViaUpstream(
         return;
       }
 
-      const pending = guard.spliced();
+      const pending = guard.release();
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       // Forward any tunnelled bytes that arrived past the CONNECT headers.
       const leftover = buffer.slice(sep + 4);
@@ -679,6 +817,9 @@ function connectViaUpstream(
 export function createProxyServer(): http.Server {
   const server = http.createServer(handleRequest);
   server.on("connect", handleConnect);
+  // Registering this listener is what stops Node from funnelling ws:// upgrades
+  // into the plain-HTTP handler, where the 101 was dropped and the client hung.
+  server.on("upgrade", handleUpgrade);
 
   // Malformed requests from a client must not take the whole server down.
   server.on("clientError", (err: NodeJS.ErrnoException, socket: net.Socket) => {
