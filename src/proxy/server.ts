@@ -29,6 +29,15 @@ import type { Egress } from "../types.js";
 
 const REALM = 'Basic realm="smart-egress-proxy"';
 
+/**
+ * Inactivity budget for anything we open towards an upstream or an origin. It is
+ * an idle timer, not a total deadline, so a slow but progressing transfer is
+ * never cut short; it only fires when nothing at all moves. Without it a silent
+ * or half-dead peer holds a client socket, and its own, for as long as the
+ * process lives.
+ */
+const UPSTREAM_IDLE_TIMEOUT_MS = 60_000;
+
 /** Headers that must never be forwarded to the target/upstream verbatim. */
 const STRIP_HEADERS = ["proxy-authorization", "proxy-connection"];
 
@@ -320,6 +329,19 @@ function handleRequest(
       return;
     }
     proxyRes.pipe(res);
+
+    // A response that dies mid-body must reach the client as a broken response.
+    // IncomingMessage swallows its own "error" when nothing listens for it, so
+    // without these two handlers a truncated upstream body leaves the client
+    // waiting forever for bytes that will never arrive.
+    proxyRes.on("error", (err) => {
+      console.warn(`[proxy] upstream response error: ${err.message}`);
+      res.destroy();
+    });
+    proxyRes.on("close", () => {
+      if (!proxyRes.complete) res.destroy();
+    });
+
     // Response-body bytes from upstream are download (IN). Observer only.
     proxyRes.on("data", (chunk: Buffer) => {
       try {
@@ -330,14 +352,32 @@ function handleRequest(
     });
   });
 
+  // Covers both the connect phase, where nothing flows yet, and a transfer that
+  // stalls halfway. Destroying with an error routes it through the handler below
+  // so the client gets a 502 instead of an open socket.
+  proxyReq.setTimeout(UPSTREAM_IDLE_TIMEOUT_MS, () => {
+    proxyReq.destroy(
+      new Error(`no activity for ${UPSTREAM_IDLE_TIMEOUT_MS}ms`),
+    );
+  });
+
   proxyReq.on("error", (err) => {
     console.warn(`[proxy] upstream request error: ${err.message}`);
-    if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("Bad Gateway");
-    } else {
+    if (res.destroyed || res.writableEnded) return;
+    if (res.headersSent) {
       res.destroy();
+      return;
     }
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("Bad Gateway");
+  });
+
+  // The client leaving must tear the upstream request down with it. pipe() only
+  // unpipes and pauses its source on a dead destination, so every cancelled
+  // download or upload would otherwise strand an established upstream socket
+  // that nothing ever reads again: one leaked descriptor per cancelled request.
+  res.on("close", () => {
+    if (!res.writableFinished) proxyReq.destroy();
   });
 
   req.pipe(proxyReq);
